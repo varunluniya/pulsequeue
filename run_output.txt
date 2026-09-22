@@ -1,0 +1,38 @@
+==============================================================================
+ED waiting room snapshot at t = 90 minutes
+==============================================================================
+  P-01 (ESI 2, waited 5 min)
+  P-02 (ESI 2, waited 10 min)
+  P-03 (ESI 3, waited 80 min)
+  P-04 (ESI 3, waited 45 min)
+  P-05 (ESI 3, waited 2 min)
+  P-06 (ESI 4, waited 85 min)
+  P-07 (ESI 5, waited 70 min)
+
+--- STATIC queue (today's status quo: acuity only, never re-scored) ---
+  1. P-02 (ESI 2, waited 10 min)
+  2. P-01 (ESI 2, waited 5 min)
+  3. P-03 (ESI 3, waited 80 min)
+  4. P-04 (ESI 3, waited 45 min)
+  5. P-05 (ESI 3, waited 2 min)
+  6. P-06 (ESI 4, waited 85 min)
+  7. P-07 (ESI 5, waited 70 min)
+
+--- PULSEQUEUE dynamic queue (acuity + elapsed wait, re-scored live) ---
+  1. P-03 (ESI 3, waited 80 min, risk score 118.0)  <-- FLAGGED for re-triage
+  2. P-04 (ESI 3, waited 45 min, risk score 79.5)  <-- FLAGGED for re-triage
+  3. P-06 (ESI 4, waited 85 min, risk score 66.8)
+  4. P-02 (ESI 2, waited 10 min, risk score 58.0)
+  5. P-01 (ESI 2, waited 5 min, risk score 49.0)
+  6. P-05 (ESI 3, waited 2 min, risk score 32.2)
+  7. P-07 (ESI 5, waited 70 min, risk score 27.5)
+
+==============================================================================
+SILENT RISERS: patients PulseQueue calls into the top 3, that the
+static acuity-only queue would NOT -- exactly the failure mode this
+system exists to catch.
+==============================================================================
+  P-04: ESI 3, waited 45 min, risk 79.5 -- static queue ranks them #4, dynamic queue moves them into the top 3.
+  P-06: ESI 4, waited 85 min, risk 66.8 -- static queue ranks them #6, dynamic queue moves them into the top 3.
+
+This is the core reframe from the design write-up: rather than a faster version of the same acuity-only queue, continuously re-scoring by acuity + elapsed wait catches the specific patients the clock is quietly endangering -- using data (ESI score, check-in timestamp) the ED already records, just never re-analyzes as time passes.
