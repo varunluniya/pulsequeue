@@ -48,6 +48,17 @@ curl localhost:8000/queue
 | `POST /patients/{id}/outcome` · `GET /metrics` | Was re-triage an upgrade? Per-ESI precision and misses |
 | `GET /proposals` · `POST /proposals/{param}/approve` | Clinical-lead approval of learned growth rates |
 
+## Demo data
+
+`python seed.py` fills `data/pulsequeue.db` with synthetic history so every endpoint returns something meaningful on first run: 14 days of waiting-room history (about 1,000 patients, vitals on hourly rounds, 30-minute re-scoring, re-triage outcomes) and a live room of 11 patients who arrived in the 2 hours before seeding. Run `python seed.py --reset` to refresh the live room.
+
+```bash
+python seed.py            # create data/pulsequeue.db
+python seed.py --reset    # rebuild it from scratch
+```
+
+The Docker image seeds `/data` on first boot (set `GEN4_SEED=0` to start empty). All of it is synthetic: no real customers, patients, tickets or model outputs. `GET /health` shows the dataset's counts.
+
 ---
 
 ## The original engine (v1)

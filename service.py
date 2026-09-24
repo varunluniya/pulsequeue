@@ -32,6 +32,7 @@ RED_FLAGS = {  # example site defaults -- see knowledge/retriage_protocol.md
 TREND_RULES = {"hr": +20, "sbp": -20, "spo2": -3}
 TREND_BONUS = 15.0
 LOAD_WAITING, LOAD_ARRIVALS = 15, 12
+MISS_WAIT_MIN = 30
 
 
 def _now_min() -> float:
@@ -204,12 +205,13 @@ class PulseQueueService:
         st = self._state(pid)
         if not st:
             raise KeyError(pid)
+        waited = round((st.get("seen_at") or _now_min()) - st["arrival"], 1)
         did = self.memory.fact(f"patient:{pid}", "flag_decision")
         if did:
-            self.memory.record_outcome(did, {"upgraded": upgraded})
-        else:  # never flagged: a miss if upgraded
+            self.memory.record_outcome(did, {"upgraded": upgraded, "waited_min": waited})
+        else:  # never flagged: a miss if upgraded after a real wait
             did = self.memory.record_decision(SYSTEM, pid, {"esi": st["esi"]}, {"flagged": False})
-            self.memory.record_outcome(did, {"upgraded": upgraded})
+            self.memory.record_outcome(did, {"upgraded": upgraded, "waited_min": waited})
         return self.learn()
 
     def learn(self, min_n: int = 10) -> dict:
@@ -219,7 +221,10 @@ class PulseQueueService:
             rows = [d for d in done if d["features"]["esi"] == esi]
             flagged = [d for d in rows if d["output"].get("flagged")]
             tp = sum(d["outcome"]["upgraded"] for d in flagged)
-            missed = sum(1 for d in rows if not d["output"].get("flagged") and d["outcome"]["upgraded"])
+            # a miss = upgraded on re-triage, never flagged, and left waiting long enough
+            # that a flag could have helped (patients seen within MISS_WAIT_MIN don't count)
+            missed = sum(1 for d in rows if not d["output"].get("flagged") and d["outcome"]["upgraded"]
+                         and d["outcome"].get("waited_min", MISS_WAIT_MIN) >= MISS_WAIT_MIN)
             prec = fb.rate(tp, len(flagged))
             per_esi[esi] = {"flagged": len(flagged), "precision": prec, "missed_upgrades": missed}
             cur = self.growth(esi)

@@ -75,22 +75,30 @@ class Memory:
 
     # -- decisions & outcomes -------------------------------------------------
     def record_decision(self, system: str, subject: str, features: dict, output: dict,
-                        decision_id: str | None = None) -> str:
+                        decision_id: str | None = None, ts: str | None = None) -> str:
         did = decision_id or uuid.uuid4().hex[:12]
         with self._tx() as c:
             c.execute("INSERT OR REPLACE INTO decisions VALUES (?,?,?,?,?,?)",
-                      (did, system, subject, _now(), json.dumps(features, default=str),
+                      (did, system, subject, ts or _now(), json.dumps(features, default=str),
                        json.dumps(output, default=str)))
         return did
 
-    def record_outcome(self, decision_id: str, outcome: dict) -> bool:
+    def record_outcome(self, decision_id: str, outcome: dict, ts: str | None = None) -> bool:
         with self._tx() as c:
             c.execute("SELECT 1 FROM decisions WHERE id=?", (decision_id,))
             if not c.fetchone():
                 return False
             c.execute("INSERT OR REPLACE INTO outcomes VALUES (?,?,?)",
-                      (decision_id, _now(), json.dumps(outcome, default=str)))
+                      (decision_id, ts or _now(), json.dumps(outcome, default=str)))
         return True
+
+    def backdate(self, decision_id: str, ts: str, outcome_ts: str | None = None) -> None:
+        """Move a decision (and optionally its outcome) into the past -- used by
+        seed scripts so synthetic history has realistic timestamps."""
+        with self._tx() as c:
+            c.execute("UPDATE decisions SET ts=? WHERE id=?", (ts, decision_id))
+            if outcome_ts:
+                c.execute("UPDATE outcomes SET ts=? WHERE decision_id=?", (outcome_ts, decision_id))
 
     def get_decision(self, decision_id: str) -> dict | None:
         rows = self._select("WHERE d.id=?", (decision_id,))
@@ -100,11 +108,15 @@ class Memory:
         return self._select("WHERE d.subject=? ORDER BY d.ts DESC LIMIT ?", (subject, limit))
 
     def decisions(self, system: str | None = None, with_outcome: bool | None = None,
-                  limit: int = 10_000) -> list[dict]:
+                  limit: int = 10_000, feature: tuple[str, Any] | None = None) -> list[dict]:
+        """`feature=("dealer_id", "D-13")` filters on a top-level feature value in SQL."""
         where, args = [], []
         if system:
             where.append("d.system=?")
             args.append(system)
+        if feature:
+            where.append("json_extract(d.features, ?) = ?")
+            args += [f"$.{feature[0]}", feature[1]]
         if with_outcome is True:
             where.append("o.decision_id IS NOT NULL")
         elif with_outcome is False:
@@ -149,11 +161,11 @@ class Memory:
             row = c.fetchone()
         return json.loads(row["value"]) if row else default
 
-    def set_param(self, name: str, value: Any, reason: str = "") -> None:
+    def set_param(self, name: str, value: Any, reason: str = "", ts: str | None = None) -> None:
         v = json.dumps(value)
         with self._tx() as c:
-            c.execute("INSERT OR REPLACE INTO params VALUES (?,?,?)", (name, v, _now()))
-            c.execute("INSERT INTO param_history VALUES (?,?,?,?)", (name, v, reason, _now()))
+            c.execute("INSERT OR REPLACE INTO params VALUES (?,?,?)", (name, v, ts or _now()))
+            c.execute("INSERT INTO param_history VALUES (?,?,?,?)", (name, v, reason, ts or _now()))
 
     def param_history(self, name: str | None = None) -> list[dict]:
         with self._tx() as c:

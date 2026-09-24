@@ -26,7 +26,8 @@ def common_router(service, name: str) -> APIRouter:
     def health():
         return {"status": "ok", "service": name, "gen4": __version__,
                 "llm_provider": service.llm.provider, "knowledge_sections": len(service.kb),
-                "memory": service.memory.stats()}
+                "memory": service.memory.stats(),
+                "dataset": service.memory.fact("dataset", "seed")}
 
     @r.get("/knowledge/search", tags=["gen4"])
     def knowledge_search(q: str, k: int = 3):

@@ -11,6 +11,8 @@ jobs:
       - run: pip install -r requirements-dev.txt
       - name: Unit tests
         run: python -m pytest -q
+      - name: Demo data seeds cleanly
+        run: python seed.py --db /tmp/seed-check.db
       - name: Eval gate (fails the build if quality drops)
         run: python run_evals.py
       - uses: actions/upload-artifact@v4
