@@ -1,0 +1,8 @@
+== PulseQueue eval ==
+cases=6 runs/case=3 accuracy=100.0% consistency=100.0%
+  governance                   acc=100.0% cons=100.0% n=1
+  no_overflag                  acc=100.0% cons=100.0% n=1
+  red_flag                     acc=100.0% cons=100.0% n=1
+  trend                        acc=100.0% cons=100.0% n=1
+  v1_parity                    acc=100.0% cons=100.0% n=2
+GATE: PASS

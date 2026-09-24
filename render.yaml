@@ -1,0 +1,16 @@
+# One-click deploy on Render: New > Blueprint > point at this repo.
+services:
+  - type: web
+    name: pulsequeue
+    runtime: docker
+    plan: starter            # a paid plan is needed for the persistent disk below
+    healthCheckPath: /health
+    disk:
+      name: pulsequeue-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: GEN4_DB
+        value: /data/pulsequeue.db
+      - key: ANTHROPIC_API_KEY   # optional -- without it the service runs in offline mode
+        sync: false

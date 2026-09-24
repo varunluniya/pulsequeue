@@ -1,0 +1,9 @@
+pt  ESI  deteriorating  v1 flag @min  v2 flag @min  v2 reason
+A   3    yes            37            20            worsening trend: hr 84->106, sbp 128->106; risk 82 crossed 70 after 20 min
+B   4    yes            91            25            vital-sign red flag: spo2 91 < 92; worsening trend: spo2 96->91
+C   3    no             37            37            risk 71 crossed 70 after 37 min
+D   4    no             101           101           risk 70 crossed 70 after 91 min
+E   2    no             47            47            risk 71 crossed 70 after 17 min
+F   5    no             -             -             
+
+Deteriorating patients flagged 17, 66 minutes earlier by v2.

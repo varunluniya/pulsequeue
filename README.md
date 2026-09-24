@@ -1,8 +1,62 @@
 # PulseQueue
 
+_A live emergency-department waiting-room monitor. It watches each patient's trajectory (acuity × wait, vital-sign red flags, worsening trends, acceleration) and learns from re-triage outcomes under clinical sign-off._
+
+[![ci](https://github.com/varunluniya/pulsequeue/actions/workflows/ci.yml/badge.svg)](https://github.com/varunluniya/pulsequeue/actions/workflows/ci.yml)
+
+> Decision support only. A clinician makes every re-triage call. Vital-sign thresholds in `knowledge/retriage_protocol.md` are example site defaults for clinical governance to set.
+
+## What's new in v2: an intelligent, deployable service
+
+| Layer | In PulseQueue |
+|---|---|
+| **Retrieval** | Site re-triage protocol. The rule behind every flag is cited |
+| **Context** | Department load (waiting, arrivals per hour) → re-check interval. Latest vitals |
+| **Memory** | Each patient's arrival, vitals readings, and 2-hour risk history |
+| **Feedback** | Re-triage outcomes → per-ESI flag precision and misses → growth-rate proposals a clinical lead approves |
+
+| Minutes until flagged | v1 (acuity × wait) | v2 |
+|---|---|---|
+| ESI 3, HR 84→106 and SBP 128→106 (each reading "normal") | 37 | **20** |
+| ESI 4, SpO₂ 96→91 | 91 | **25** |
+| Four stable patients | unchanged | unchanged (no alarm inflation) |
+
+With no vitals entered, v2 reproduces v1's ordering and silent risers exactly (checked in the eval gate). Full framework write-up: [FRAMEWORK.md](FRAMEWORK.md).
+
+## Run it
+
+```bash
+pip install -r requirements-dev.txt
+uvicorn app:app --reload        # http://127.0.0.1:8000/docs
+python -m pytest -q             # original 11 engine tests + service/API tests
+python run_evals.py             # behavioural eval gate
+python compare_v1_v2.py         # before/after proof
+```
+
+Docker: `docker build -t pulsequeue . && docker run -p 8000:8000 -v pulsequeue-data:/data pulsequeue` · Render: `render.yaml`.
+
+```bash
+curl -X POST localhost:8000/patients -H 'content-type: application/json' -d '{"patient_id":"P-11","esi":3}'
+curl -X POST localhost:8000/patients/P-11/vitals -H 'content-type: application/json' -d '{"hr":104,"sbp":102,"spo2":95}'
+curl localhost:8000/queue
+```
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /patients` · `POST /patients/{id}/vitals` · `POST /patients/{id}/seen` | Waiting-room events |
+| `GET /queue` | Ranked queue: risk, red flags, trends, accelerating, silent risers, static rank, handoff summary, trace |
+| `POST /patients/{id}/outcome` · `GET /metrics` | Was re-triage an upgrade? Per-ESI precision and misses |
+| `GET /proposals` · `POST /proposals/{param}/approve` | Clinical-lead approval of learned growth rates |
+
+---
+
+## The original engine (v1)
+
+The v1 demo still runs unchanged; the service wraps it.
+
 A dynamic re-scoring engine for emergency department waiting rooms.
 
-## The problem
+### The problem
 
 Emergency departments triage every patient on arrival with an acuity
 score (ESI, 1–5) and then work the waiting room in acuity order. That
@@ -18,7 +72,7 @@ without being seen (LWBS) — driven less by total department capacity
 than by exactly this blind spot: nobody is watching *how the risk of
 already-triaged patients changes while they wait*.
 
-## What PulseQueue does
+### What PulseQueue does
 
 PulseQueue continuously re-scores every patient still in the queue by
 combining their original acuity with elapsed wait time, and flags
@@ -43,7 +97,7 @@ would call into the front of the line that the static queue would
 leave sitting further back — the specific failure mode this design
 exists to catch.
 
-## Running it
+### Running it
 
 ```bash
 pip install pytest   # only needed to run the test suite
@@ -60,7 +114,7 @@ higher-acuity patients who simply arrived more recently, and two
 patients the static queue ranks 4th and 6th are surfaced as silent
 risers the acuity-only ordering would have missed.
 
-## A real bug found and fixed while building this
+### A real bug found and fixed while building this
 
 The first version of `cli.py`'s `--time` flag let you point the
 simulation at any clock time, including one earlier than some sample
@@ -73,7 +127,7 @@ the scenario's latest patient arrival up front and fail with a clear,
 actionable message instead of a stack trace. Caught by actually running
 the CLI with a boundary input, not by reading the code.
 
-## Files
+### Files
 
 - `triage_engine.py` — the core engine: `Patient`, the dynamic risk
   formula, the static and dynamic queue builders, and silent-riser
@@ -88,7 +142,7 @@ the CLI with a boundary input, not by reading the code.
   correctly find nothing).
 - `run_output.txt` — captured real output from `simulate.py`.
 
-## Design note
+### Design note
 
 This project started as a design exercise: reframe "reduce ED wait
 time" away from a generic speed target and toward the specific,
