@@ -21,7 +21,7 @@ import os
 import time
 from pathlib import Path
 
-from gen4 import Context, KnowledgeBase, LLMClient, Memory, Trace
+from gen4 import Context, KnowledgeBase, LLMClient, Memory, Trace, guardrail_check
 from gen4 import feedback as fb
 from triage_engine import BASE_RISK_PER_URGENCY_POINT, RE_TRIAGE_RISK_THRESHOLD, RISK_PER_MINUTE_BY_URGENCY
 
@@ -168,7 +168,8 @@ class PulseQueueService:
             q += " accelerating risk"
         if high_load:
             q += " department load"
-        trace.cite(self.kb.search(q, k=3))
+        passages = self.kb.search(q, k=3)
+        trace.cite(passages)
         trace.memory = {"patients_with_vitals": sum(1 for p in pts if p["vitals"])}
 
         if record:
@@ -180,11 +181,11 @@ class PulseQueueService:
                 if s["flagged"] and not self.memory.facts(f"patient:{st['id']}", "flag_decision"):
                     did = self.memory.record_decision(SYSTEM, st["id"], {"esi": st["esi"]}, s)
                     self.memory.add_fact(f"patient:{st['id']}", "flag_decision", did)
-        summary = self._handoff(scored)
+        summary = self._handoff(scored, passages)
         trace.model = {"provider": self.llm.last_provider}
         return {"now": now, "queue": scored, "handoff_summary": summary, "trace": trace.as_dict()}
 
-    def _handoff(self, scored: list[dict]) -> str:
+    def _handoff(self, scored: list[dict], passages) -> str:
         def offline():
             flagged = [s for s in scored if s["flagged"]]
             if not flagged:
@@ -195,9 +196,28 @@ class PulseQueueService:
                 lines.append(f"- {s['patient_id']} ESI {s['esi']}, {s['waited_min']:.0f} min{tag}: "
                              + "; ".join(s["reasons"]))
             return "\n".join(lines)
-        return self.llm.complete("Write a 5-line charge-nurse handoff from this queue JSON: "
-                                 f"{[{k: s[k] for k in ('patient_id','esi','waited_min','reasons')} for s in scored if s['flagged']]}",
-                                 offline=offline, max_tokens=250)
+        draft = self.llm.complete("Write a 5-line charge-nurse handoff from this queue JSON: "
+                                  f"{[{k: s[k] for k in ('patient_id','esi','waited_min','reasons')} for s in scored if s['flagged']]}",
+                                  offline=offline, max_tokens=250)
+        return self._guarded(draft, scored, offline(), passages)
+
+    def _guarded(self, draft: str, scored: list[dict], fallback: str, passages) -> str:
+        """Post-model guardrail (Guide 4 Section 7.3): this handoff note is the one
+        thing a charge nurse reads to catch a deteriorating patient the static
+        acuity queue would miss. A draft that silently drops a flagged patient --
+        especially one marked accelerating -- is not a stylistic slip, it is the
+        exact failure this whole system exists to prevent, and it would not show
+        up in the retrieval trace at all."""
+        def offline_check(response: str, _passages) -> tuple[bool, str]:
+            missing = [s["patient_id"] for s in scored
+                      if s["flagged"] and s["accelerating"] and s["patient_id"] not in response]
+            if missing:
+                return False, f"draft omits accelerating flagged patient(s) {missing}"
+            return True, ""
+        is_safe, reason = guardrail_check(draft, passages, self.llm, offline=offline_check)
+        if is_safe:
+            return draft
+        return fallback + f"\n(Note: guardrail replaced a draft that {reason}.)"
 
     # -- feedback -----------------------------------------------------------------------
     def outcome(self, pid: str, upgraded: bool) -> dict:

@@ -21,10 +21,11 @@ from .context import Context
 from .memory import Memory
 from .llm import LLMClient
 from .trace import Trace
+from .guardrail import guardrail_check
 from . import feedback, evals
 
 __all__ = [
     "KnowledgeBase", "Passage", "Context", "Memory", "LLMClient", "Trace",
-    "feedback", "evals",
+    "feedback", "evals", "guardrail_check",
 ]
 __version__ = "1.0.0"
