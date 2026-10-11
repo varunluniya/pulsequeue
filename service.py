@@ -21,7 +21,7 @@ import os
 import time
 from pathlib import Path
 
-from gen4 import Context, KnowledgeBase, LLMClient, Memory, Trace
+from gen4 import Context, KnowledgeBase, LLMClient, Memory, Trace, guardrail_check
 from gen4 import feedback as fb
 from triage_engine import BASE_RISK_PER_URGENCY_POINT, RE_TRIAGE_RISK_THRESHOLD, RISK_PER_MINUTE_BY_URGENCY
 
@@ -168,7 +168,8 @@ class PulseQueueService:
             q += " accelerating risk"
         if high_load:
             q += " department load"
-        trace.cite(self.kb.search(q, k=3))
+        passages = self.kb.search(q, k=3)
+        trace.cite(passages)
         trace.memory = {"patients_with_vitals": sum(1 for p in pts if p["vitals"])}
 
         if record:
@@ -180,11 +181,11 @@ class PulseQueueService:
                 if s["flagged"] and not self.memory.facts(f"patient:{st['id']}", "flag_decision"):
                     did = self.memory.record_decision(SYSTEM, st["id"], {"esi": st["esi"]}, s)
                     self.memory.add_fact(f"patient:{st['id']}", "flag_decision", did)
-        summary = self._handoff(scored)
+        summary = self._handoff(scored, passages)
         trace.model = {"provider": self.llm.last_provider}
         return {"now": now, "queue": scored, "handoff_summary": summary, "trace": trace.as_dict()}
 
-    def _handoff(self, scored: list[dict]) -> str:
+    def _handoff(self, scored: list[dict], passages) -> str:
         def offline():
             flagged = [s for s in scored if s["flagged"]]
             if not flagged:
@@ -195,9 +196,28 @@ class PulseQueueService:
                 lines.append(f"- {s['patient_id']} ESI {s['esi']}, {s['waited_min']:.0f} min{tag}: "
                              + "; ".join(s["reasons"]))
             return "\n".join(lines)
-        return self.llm.complete("Write a 5-line charge-nurse handoff from this queue JSON: "
-                                 f"{[{k: s[k] for k in ('patient_id','esi','waited_min','reasons')} for s in scored if s['flagged']]}",
-                                 offline=offline, max_tokens=250)
+        draft = self.llm.complete("Write a 5-line charge-nurse handoff from this queue JSON: "
+                                  f"{[{k: s[k] for k in ('patient_id','esi','waited_min','reasons')} for s in scored if s['flagged']]}",
+                                  offline=offline, max_tokens=250)
+        return self._guarded(draft, scored, offline(), passages)
+
+    def _guarded(self, draft: str, scored: list[dict], fallback: str, passages) -> str:
+        """Post-model guardrail: this handoff note is the one
+        thing a charge nurse reads to catch a deteriorating patient the static
+        acuity queue would miss. A draft that silently drops a flagged patient --
+        especially one marked accelerating -- is not a stylistic slip, it is the
+        exact failure this whole system exists to prevent, and it would not show
+        up in the retrieval trace at all."""
+        def offline_check(response: str, _passages) -> tuple[bool, str]:
+            missing = [s["patient_id"] for s in scored
+                      if s["flagged"] and s["accelerating"] and s["patient_id"] not in response]
+            if missing:
+                return False, f"draft omits accelerating flagged patient(s) {missing}"
+            return True, ""
+        is_safe, reason = guardrail_check(draft, passages, self.llm, offline=offline_check)
+        if is_safe:
+            return draft
+        return fallback + f"\n(Note: guardrail replaced a draft that {reason}.)"
 
     # -- feedback -----------------------------------------------------------------------
     def outcome(self, pid: str, upgraded: bool) -> dict:
@@ -214,27 +234,42 @@ class PulseQueueService:
             self.memory.record_outcome(did, {"upgraded": upgraded, "waited_min": waited})
         return self.learn()
 
+    # Outcomes here are recorded same-day as the decision (seed.py backdates
+    # both to the same timestamp), so a 1-day grace period is ample -- see
+    # gen4/feedback.py's new_rows_since() and the classic late-arrival lesson.
+    LEARN_KEY = "pulsequeue_learn"
+    LEARN_GRACE_DAYS = 1
+
     def learn(self, min_n: int = 10) -> dict:
-        done = self.memory.decisions(system=SYSTEM, with_outcome=True)
+        """Incremental: pulls only decisions whose outcome arrived since the
+        last call, and merges per-ESI counts into a persisted running total
+        instead of re-grouping every decision+outcome the system has ever
+        logged on every call (the applied incremental-loading fix)."""
+        new = fb.new_rows_since(self.memory, SYSTEM, self.LEARN_KEY, grace_days=self.LEARN_GRACE_DAYS)
         per_esi, proposals = {}, []
         for esi in range(1, 6):
-            rows = [d for d in done if d["features"]["esi"] == esi]
+            rows = [d for d in new if d["features"]["esi"] == esi]
             flagged = [d for d in rows if d["output"].get("flagged")]
             tp = sum(d["outcome"]["upgraded"] for d in flagged)
             # a miss = upgraded on re-triage, never flagged, and left waiting long enough
             # that a flag could have helped (patients seen within MISS_WAIT_MIN don't count)
             missed = sum(1 for d in rows if not d["output"].get("flagged") and d["outcome"]["upgraded"]
                          and d["outcome"].get("waited_min", MISS_WAIT_MIN) >= MISS_WAIT_MIN)
-            prec = fb.rate(tp, len(flagged))
-            per_esi[esi] = {"flagged": len(flagged), "precision": prec, "missed_upgrades": missed}
+            totals = fb.accumulate(self.memory, f"{self.LEARN_KEY}:esi{esi}",
+                                   rows=len(rows), flagged=len(flagged), tp=tp, missed=missed)
+            prec = fb.rate(totals.get("tp", 0), totals.get("flagged", 0))
+            per_esi[esi] = {"flagged": totals.get("flagged", 0), "precision": prec,
+                            "missed_upgrades": totals.get("missed", 0)}
             cur = self.growth(esi)
-            if missed >= 3 and missed / max(1, len(rows)) > 0.2:
+            rows_n, missed_n = totals.get("rows", 0), totals.get("missed", 0)
+            if missed_n >= 3 and missed_n / max(1, rows_n) > 0.2:
                 proposals.append(fb.propose(self.memory, f"growth:esi{esi}", cur, round(cur * 1.1, 3),
-                                            f"{missed} ESI-{esi} patients were upgraded without a flag",
+                                            f"{missed_n} ESI-{esi} patients were upgraded without a flag",
                                             per_esi[esi]))
-            elif len(flagged) >= min_n and prec is not None and prec < 0.2:
+            elif per_esi[esi]["flagged"] >= min_n and prec is not None and prec < 0.2:
                 proposals.append(fb.propose(self.memory, f"growth:esi{esi}", cur, round(cur * 0.9, 3),
                                             f"only {prec:.0%} of ESI-{esi} flags led to an upgrade",
                                             per_esi[esi]))
         self.memory.add_fact("model:pulsequeue", "flag_performance", per_esi)
+        fb.mark_processed(self.memory, self.LEARN_KEY, new)
         return {"per_esi": per_esi, "new_proposals": proposals}

@@ -31,6 +31,13 @@ CREATE TABLE IF NOT EXISTS decisions (
     features TEXT, output TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_decisions_subject ON decisions(subject);
+-- decisions(system=..., limit=...) orders by d.ts DESC with a
+-- LIMIT, which looks bounded but without this index SQLite still does a
+-- full table SCAN + a temp B-tree sort to produce that order (verified via
+-- EXPLAIN QUERY PLAN) -- cost grows with total decision count regardless
+-- of how small the LIMIT or result window is. This index lets it SEARCH
+-- by system and walk straight in ts-descending order instead.
+CREATE INDEX IF NOT EXISTS ix_decisions_system_ts ON decisions(system, ts DESC);
 CREATE TABLE IF NOT EXISTS outcomes (
     decision_id TEXT PRIMARY KEY, ts TEXT, outcome TEXT
 );
@@ -43,6 +50,9 @@ CREATE TABLE IF NOT EXISTS param_history (
 CREATE TABLE IF NOT EXISTS facts (
     subject TEXT, predicate TEXT, object TEXT, weight REAL, source TEXT, ts TEXT,
     PRIMARY KEY (subject, predicate)
+);
+CREATE TABLE IF NOT EXISTS fact_history (
+    subject TEXT, predicate TEXT, object TEXT, weight REAL, source TEXT, ts TEXT
 );
 """
 
@@ -108,8 +118,18 @@ class Memory:
         return self._select("WHERE d.subject=? ORDER BY d.ts DESC LIMIT ?", (subject, limit))
 
     def decisions(self, system: str | None = None, with_outcome: bool | None = None,
-                  limit: int = 10_000, feature: tuple[str, Any] | None = None) -> list[dict]:
-        """`feature=("dealer_id", "D-13")` filters on a top-level feature value in SQL."""
+                  limit: int = 10_000, feature: tuple[str, Any] | None = None,
+                  outcome_since: str | None = None) -> list[dict]:
+        """`feature=("dealer_id", "D-13")` filters on a top-level feature value in SQL.
+
+        `outcome_since` is the incremental-loading hook: pass a timestamp to
+        get back only rows whose OUTCOME arrived after it (not the decision
+        itself -- outcomes routinely land long after their decision, so this
+        is the column that actually needs watermarking). Implies
+        `with_outcome=True` unless explicitly overridden. See
+        `gen4/feedback.py`'s `new_rows_since()` for the idempotent,
+        grace-period-aware wrapper that should normally be used instead of
+        calling this directly with a raw cutoff."""
         where, args = [], []
         if system:
             where.append("d.system=?")
@@ -117,6 +137,11 @@ class Memory:
         if feature:
             where.append("json_extract(d.features, ?) = ?")
             args += [f"$.{feature[0]}", feature[1]]
+        if outcome_since is not None:
+            where.append("o.ts > ?")
+            args.append(outcome_since)
+            if with_outcome is None:
+                with_outcome = True
         if with_outcome is True:
             where.append("o.decision_id IS NOT NULL")
         elif with_outcome is False:
@@ -133,6 +158,7 @@ class Memory:
             "id": r["id"], "system": r["system"], "subject": r["subject"], "ts": r["ts"],
             "features": json.loads(r["features"]), "output": json.loads(r["output"]),
             "outcome": json.loads(r["outcome"]) if r["outcome"] else None,
+            "outcome_ts": r["outcome_ts"],
         } for r in rows]
 
     def similar(self, features: dict, keys: list[str], system: str | None = None,
@@ -180,9 +206,19 @@ class Memory:
     # -- knowledge graph ---------------------------------------------------------
     def add_fact(self, subject: str, predicate: str, obj: Any, weight: float = 1.0,
                  source: str = "feedback") -> None:
+        """Upserts the CURRENT value of (subject, predicate) in `facts` --
+        but also appends it to `fact_history`, so a value that gets
+        recomputed and overwritten repeatedly (a calibration result, an
+        override-rate snapshot) still has a recoverable history instead of
+        only ever showing the latest write. Previously `facts` alone lost
+        that history on every overwrite -- the SCD Type 2 pattern `params`/
+        `param_history` already used, just missing here."""
+        ts = _now()
         with self._tx() as c:
             c.execute("INSERT OR REPLACE INTO facts VALUES (?,?,?,?,?,?)",
-                      (subject, predicate, json.dumps(obj, default=str), weight, source, _now()))
+                      (subject, predicate, json.dumps(obj, default=str), weight, source, ts))
+            c.execute("INSERT INTO fact_history VALUES (?,?,?,?,?,?)",
+                      (subject, predicate, json.dumps(obj, default=str), weight, source, ts))
 
     def facts(self, subject: str | None = None, predicate: str | None = None) -> list[dict]:
         where, args = [], []
@@ -204,10 +240,28 @@ class Memory:
         f = self.facts(subject, predicate)
         return f[0]["object"] if f else default
 
+    def fact_history(self, subject: str | None = None, predicate: str | None = None) -> list[dict]:
+        """Every value (subject, predicate) has ever held, oldest first --
+        the recovery path for a fact that `add_fact` has since overwritten."""
+        where, args = [], []
+        if subject:
+            where.append("subject=?")
+            args.append(subject)
+        if predicate:
+            where.append("predicate=?")
+            args.append(predicate)
+        clause = ("WHERE " + " AND ".join(where)) if where else ""
+        with self._tx() as c:
+            c.execute(f"SELECT * FROM fact_history {clause} ORDER BY ts", tuple(args))
+            rows = c.fetchall()
+        return [{"subject": r["subject"], "predicate": r["predicate"],
+                 "object": json.loads(r["object"]), "weight": r["weight"],
+                 "source": r["source"], "ts": r["ts"]} for r in rows]
+
     def stats(self) -> dict:
         with self._tx() as c:
             counts = {}
-            for t in ("decisions", "outcomes", "params", "facts"):
+            for t in ("decisions", "outcomes", "params", "facts", "fact_history"):
                 c.execute(f"SELECT COUNT(*) AS n FROM {t}")
                 counts[t] = c.fetchone()["n"]
         return counts

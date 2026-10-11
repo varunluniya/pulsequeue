@@ -11,6 +11,99 @@ Small, auditable primitives. The rule every service follows:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta
+
+
+def new_rows_since(memory, system: str, watermark_key: str, grace_days: float = 0.0,
+                   limit: int = 10_000, feature: tuple | None = None) -> list[dict]:
+    """The incremental-loading fix for `learn()`-style functions: instead
+    of re-pulling and re-aggregating every decision that has ever had an
+    outcome, pull only the outcomes that arrived after the last watermark,
+    with a `grace_days` buffer to catch outcomes that were recorded with a
+    timestamp earlier than the current watermark (a classic late-arriving-
+    data gap -- these services genuinely have that shape, since an
+    outcome's timestamp is backdated to when the underlying event
+    happened, which can be well before the watermark that was already
+    advanced past it).
+
+    The grace-period re-pull necessarily re-returns some already-processed
+    rows -- that overlap is handled by `mark_processed()` below via a
+    persisted set of decision ids, not by the timestamp filter alone,
+    which is what keeps repeated calls idempotent: safe to re-run without
+    double-counting."""
+    wm = memory.get_param(f"watermark:{watermark_key}")
+    since = None
+    if wm:
+        since = (datetime.fromisoformat(wm) - timedelta(days=grace_days)).isoformat()
+    candidates = memory.decisions(system=system, with_outcome=True, outcome_since=since,
+                                  limit=limit, feature=feature)
+    processed = set(memory.get_param(f"processed:{watermark_key}", []))
+    return [r for r in candidates if r["id"] not in processed]
+
+
+def mark_processed(memory, watermark_key: str, rows: list[dict]) -> None:
+    """Commit a batch `new_rows_since()` returned: extend the processed-id
+    set (so a grace-period re-pull of the same rows next time is a no-op)
+    and advance the watermark to the latest outcome timestamp actually seen
+    -- never further, and only after the caller's merge into its running
+    aggregate has already succeeded, so a failure midway never loses or
+    duplicates anything on the next attempt."""
+    if not rows:
+        return
+    processed = set(memory.get_param(f"processed:{watermark_key}", []))
+    processed.update(r["id"] for r in rows)
+    memory.set_param(f"processed:{watermark_key}", sorted(processed),
+                     reason="incremental learn(): mark rows processed")
+    latest = max(r["outcome_ts"] for r in rows if r.get("outcome_ts"))
+    memory.set_param(f"watermark:{watermark_key}", latest,
+                     reason="incremental learn(): advance watermark")
+
+
+def accumulate(memory, key: str, **deltas: float) -> dict:
+    """Merge numeric deltas (counts, sums) into a persisted running total
+    under `accum:{key}`, and return the updated totals. The point: a
+    `learn()`-style function should only ever need to know the delta its
+    NEW batch contributes -- never re-derive the running total by re-reading
+    every historical row, which is the full-load pattern this whole fix
+    replaces."""
+    state = memory.get_param(f"accum:{key}", {})
+    for k, v in deltas.items():
+        state[k] = state.get(k, 0) + v
+    memory.set_param(f"accum:{key}", state, reason="incremental learn() update")
+    return state
+
+
+def incremental_calibration(memory, key: str, new_pairs: list[tuple[float, int]], bins: int = 5) -> dict:
+    """Same contract as `calibration()` below, but the result is built from
+    a persisted per-bin running state (n, sum of predicted, sum of observed)
+    updated with only the NEW pairs -- so repeated calls never need to
+    re-read or re-bin a single old decision+outcome row."""
+    state = memory.get_param(f"calstate:{key}", {
+        "bins": [{"n": 0, "sum_p": 0.0, "sum_y": 0.0} for _ in range(bins)],
+        "n": 0, "sum_sq_err": 0.0,
+    })
+    for p, y in new_pairs:
+        i = min(bins - 1, max(0, int(p * bins)))
+        b = state["bins"][i]
+        b["n"] += 1
+        b["sum_p"] += p
+        b["sum_y"] += y
+        state["n"] += 1
+        state["sum_sq_err"] += (p - y) ** 2
+    memory.set_param(f"calstate:{key}", state, reason="incremental calibration update")
+    if state["n"] == 0:
+        return {"n": 0, "brier": None, "ece": None, "bins": []}
+    out, ece = [], 0.0
+    for i, b in enumerate(state["bins"]):
+        if b["n"] == 0:
+            continue
+        pred, obs = b["sum_p"] / b["n"], b["sum_y"] / b["n"]
+        ece += abs(pred - obs) * b["n"] / state["n"]
+        lo, hi = i / bins, (i + 1) / bins
+        out.append({"range": f"{lo:.1f}-{hi:.1f}", "n": b["n"],
+                    "predicted": round(pred, 3), "observed": round(obs, 3)})
+    brier = state["sum_sq_err"] / state["n"]
+    return {"n": state["n"], "brier": round(brier, 4), "ece": round(ece, 4), "bins": out}
 
 
 def bounded_step(current: float, target: float, rate: float, lo: float, hi: float,
